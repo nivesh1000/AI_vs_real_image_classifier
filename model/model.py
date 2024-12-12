@@ -1,61 +1,166 @@
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Dense, Flatten, Dropout
-from tensorflow.keras.applications import ResNet50
+from tensorflow.keras.layers import Dense, Dropout
+from tensorflow.keras.applications import DenseNet121
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import EarlyStopping
-from tensorflow.keras.regularizers import l2
-
-# Normalize pixel values and create generators for train and validation datasets
-train_datagen = ImageDataGenerator(rescale=1.0 / 255)
-val_datagen = ImageDataGenerator(rescale=1.0 / 255)
-
-train_generator = train_datagen.flow_from_directory(
-    'Dataset/train',                # Path to training data
-    target_size=(224, 224),         # Resize images to 224x224
-    batch_size=32,                  # Load images in batches of 32
-    class_mode='binary'             # Binary classification
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score, classification_report
 )
+import tensorflow as tf
+import os
 
-val_generator = val_datagen.flow_from_directory(
-    'Dataset/valid',                # Path to validation data
-    target_size=(224, 224),         # Resize images to 224x224
-    batch_size=32,                  # Load images in batches of 32
-    class_mode='binary'             # Binary classification
-)
+def create_data_generator(directory: str, target_size: tuple, batch_size: int, 
+                          class_mode: str, shuffle: bool) -> tf.keras.preprocessing.image.DirectoryIterator:
+    """
+    Create a data generator for the given directory.
+    Args:
+        directory: Path to the dataset directory.
+        target_size: Tuple indicating the target size of the images.
+        batch_size: Number of images per batch.
+        class_mode: Mode of classification (e.g., 'binary', 'categorical').
+        shuffle: Whether to shuffle the data.
+    Returns:
+        A DirectoryIterator object for the dataset.
+    """
+    datagen = ImageDataGenerator(rescale=1.0 / 255)
+    return datagen.flow_from_directory(
+        directory,
+        target_size=target_size,
+        batch_size=batch_size,
+        class_mode=class_mode,
+        shuffle=shuffle
+    )
 
-base_model = ResNet50(include_top=False, weights='imagenet', input_shape=(224, 224, 3))
+def prepare_data_generators():
+    """
+    Create data generators for training, validation, and testing datasets.
+    Returns:
+        train_generator: Generator for training data.
+        val_generator: Generator for validation data.
+        test_generator: Generator for testing data.
+    """
+    train_val_generator = lambda dir_path: create_data_generator(
+        directory=dir_path,
+        target_size=(224, 224),
+        batch_size=32,
+        class_mode='binary',
+        shuffle=True
+    )
 
-# Unfreeze all layers in the base model (for fine-tuning)
-for layer in base_model.layers:
-    layer.trainable = True
+    train_generator = train_val_generator('Dataset/train')
+    val_generator = train_val_generator('Dataset/valid')
 
-model = Sequential([
-    base_model,                             # Pre-trained ResNet50 base
-    Flatten(),                              # Flatten the output from the base model
-    Dense(320, activation='relu'),          # Fully connected layer with 320 nodes
-    Dropout(0.5),                           # Dropout layer for regularization
-    Dense(1, activation='sigmoid',          # Output layer for binary classification
-          kernel_regularizer=l2(0.01))      # Add L2 regularization
-])
+    test_generator = create_data_generator(
+        directory='Dataset/test',
+        target_size=(224, 224),
+        batch_size=32,
+        class_mode='binary',
+        shuffle=False
+    )
 
-model.compile(
-    optimizer=Adam(learning_rate=0.001),    # Adam optimizer with a learning rate of 0.001
-    loss='binary_crossentropy',            # Binary cross-entropy loss
-    metrics=['accuracy']                   # Track accuracy during training
-)
+    return train_generator, val_generator, test_generator
 
-early_stopping = EarlyStopping(
-    monitor='val_loss',                    # Monitor validation loss
-    patience=3,                            # Stop after 3 epochs of no improvement
-    restore_best_weights=True              # Restore weights from the best epoch
-)
+def build_model() -> Sequential:
+    """
+    Build a DenseNet121-based sequential model for binary classification.
+    Returns:
+        model: Compiled Keras model.
+    """
+    base_model = DenseNet121(
+        weights="imagenet", include_top=False, input_shape=(224, 224, 3)
+    )
 
-history = model.fit(
-    train_generator,
-    validation_data=val_generator,
-    epochs=10,                             # Maximum number of epochs
-    steps_per_epoch=len(train_generator),  # Total batches per epoch
-    validation_steps=len(val_generator),   # Total batches for validation
-    callbacks=[early_stopping]             # Use EarlyStopping during training
-)
+    model = Sequential([
+        base_model,
+        tf.keras.layers.GlobalAveragePooling2D(),
+        Dense(512, activation='relu'),
+        tf.keras.layers.BatchNormalization(),
+        Dropout(0.3),
+        Dense(64, activation='relu'),
+        Dropout(0.6),
+        Dense(32, activation='relu'),
+        Dropout(0.6),
+        Dense(1, activation='sigmoid')
+    ])
+
+    model.compile(
+        optimizer=Adam(learning_rate=0.00005),
+        loss='binary_crossentropy',
+        metrics=['accuracy']
+    )
+
+    return model
+
+def train_model(model: Sequential, train_gen, val_gen) -> tf.keras.callbacks.History:
+    """
+    Train the model using training and validation generators.
+    Args:
+        model: Compiled Keras model.
+        train_gen: Training data generator.
+        val_gen: Validation data generator.
+    Returns:
+        history: Training history.
+    """
+    early_stopping = EarlyStopping(
+        monitor='val_loss',
+        patience=3,
+        restore_best_weights=True
+    )
+
+    history = model.fit(
+        train_gen,
+        validation_data=val_gen,
+        epochs=10,
+        steps_per_epoch=len(train_gen),
+        validation_steps=len(val_gen),
+        callbacks=[early_stopping]
+    )
+
+    return history
+
+def save_model(model: Sequential, save_path: str):
+    """
+    Save the trained model to the specified path.
+    Args:
+        model: Trained Keras model.
+        save_path: Path to save the model.
+    """
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    model.save(save_path)
+    print(f"Model saved at {save_path}")
+
+def evaluate_model(model: Sequential, test_gen):
+    """
+    Evaluate the model using the test data generator.
+    Args:
+        model: Trained Keras model.
+        test_gen: Test data generator.
+    """
+    predictions = model.predict(test_gen)
+    predicted_classes = (predictions > 0.5).astype(int)
+
+    true_classes = test_gen.classes
+    class_labels = list(test_gen.class_indices.keys())
+
+    accuracy = accuracy_score(true_classes, predicted_classes)
+    precision = precision_score(true_classes, predicted_classes)
+    recall = recall_score(true_classes, predicted_classes)
+    f1 = f1_score(true_classes, predicted_classes)
+
+    print("Test Metrics:")
+    print(f"Accuracy:  {accuracy:.4f}")
+    print(f"Precision: {precision:.4f}")
+    print(f"Recall:    {recall:.4f}")
+    print(f"F1 Score:  {f1:.4f}")
+    print("\nClassification Report:")
+    print(classification_report(true_classes, predicted_classes,
+                                target_names=class_labels))
+
+if __name__ == "__main__":
+    train_gen, val_gen, test_gen = prepare_data_generators()
+    model = build_model()
+    model.summary()
+    history = train_model(model, train_gen, val_gen)
+    save_model(model, "saved_models/densenet_model.h5")
+    evaluate_model(model, test_gen)
